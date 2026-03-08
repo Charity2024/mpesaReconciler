@@ -11,7 +11,8 @@ import {
   FileText, 
   ArrowRightLeft,
   Trash2,
-  ExternalLink
+  CheckSquare,
+  Info,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { MpesaRecord, ReconciliationResult } from './types';
@@ -22,6 +23,14 @@ const COLORS = {
   lightGray: '#f3f4f6',
 };
 
+/** Normalize code for matching: trim, uppercase, collapse spaces. Reduces false "missing" when exports differ. */
+function normalizeCode(code: string): string {
+  return String(code)
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+}
+
 export default function App() {
   const [paymentFile, setPaymentFile] = useState<File | null>(null);
   const [ticketFile, setTicketFile] = useState<File | null>(null);
@@ -29,6 +38,8 @@ export default function App() {
   const [isComparing, setIsComparing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [resolvedMissingCodes, setResolvedMissingCodes] = useState<Set<string>>(new Set());
+  const [resolvedInvalidCodes, setResolvedInvalidCodes] = useState<Set<string>>(new Set());
 
   const paymentInputRef = useRef<HTMLInputElement>(null);
   const ticketInputRef = useRef<HTMLInputElement>(null);
@@ -77,21 +88,41 @@ export default function App() {
     if (!paymentFile || !ticketFile) return;
 
     setIsComparing(true);
-    // Simulate progress
     await new Promise(resolve => setTimeout(resolve, 800));
 
     const payments = await parseFile(paymentFile);
     const tickets = await parseFile(ticketFile);
 
-    const paymentMap = new Map(payments.map(p => [p.code, p]));
-    const ticketMap = new Map(tickets.map(t => [t.code, t]));
+    const normalizedPaymentCodes = new Set(payments.map(p => normalizeCode(p.code)));
+    const normalizedTicketCodes = new Set(tickets.map(t => normalizeCode(t.code)));
 
-    const paymentCodes = new Set(payments.map(p => p.code));
-    const ticketCodes = new Set(tickets.map(t => t.code));
+    const seenMissing = new Set<string>();
+    const seenInvalid = new Set<string>();
+    const seenValid = new Set<string>();
 
-    const missingTickets = payments.filter(p => !ticketCodes.has(p.code));
-    const invalidTickets = tickets.filter(t => !paymentCodes.has(t.code));
-    const validTickets = payments.filter(p => ticketCodes.has(p.code));
+    const missingTickets = payments.filter(p => {
+      const key = normalizeCode(p.code);
+      if (normalizedTicketCodes.has(key)) return false;
+      if (seenMissing.has(key)) return false;
+      seenMissing.add(key);
+      return true;
+    });
+
+    const invalidTickets = tickets.filter(t => {
+      const key = normalizeCode(t.code);
+      if (normalizedPaymentCodes.has(key)) return false;
+      if (seenInvalid.has(key)) return false;
+      seenInvalid.add(key);
+      return true;
+    });
+
+    const validTickets = payments.filter(p => {
+      const key = normalizeCode(p.code);
+      if (!normalizedTicketCodes.has(key)) return false;
+      if (seenValid.has(key)) return false;
+      seenValid.add(key);
+      return true;
+    });
 
     setResults({
       payments,
@@ -100,6 +131,8 @@ export default function App() {
       invalidTickets,
       validTickets
     });
+    setResolvedMissingCodes(new Set());
+    setResolvedInvalidCodes(new Set());
     setIsComparing(false);
   };
 
@@ -135,15 +168,27 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const markMissingResolved = (code: string) => {
+    setResolvedMissingCodes(prev => new Set(prev).add(normalizeCode(code)));
+  };
+  const markInvalidResolved = (code: string) => {
+    setResolvedInvalidCodes(prev => new Set(prev).add(normalizeCode(code)));
+  };
+
   const filteredResults = useMemo(() => {
     if (!results) return null;
-    const query = searchQuery.toUpperCase();
+    const query = searchQuery.toUpperCase().replace(/\s+/g, '');
+    const match = (r: MpesaRecord) =>
+      normalizeCode(r.code).includes(query) || (r.name && r.name.toUpperCase().replace(/\s+/g, '').includes(query));
+    const missingFiltered = results.missingTickets.filter(match);
+    const invalidFiltered = results.invalidTickets.filter(r => normalizeCode(r.code).includes(query));
+    const validFiltered = results.validTickets.filter(match);
     return {
-      missingTickets: results.missingTickets.filter(r => r.code.includes(query) || r.name?.toUpperCase().includes(query)),
-      invalidTickets: results.invalidTickets.filter(r => r.code.includes(query)),
-      validTickets: results.validTickets.filter(r => r.code.includes(query) || r.name?.toUpperCase().includes(query))
+      missingTickets: missingFiltered.filter(r => !resolvedMissingCodes.has(normalizeCode(r.code))),
+      invalidTickets: invalidFiltered.filter(r => !resolvedInvalidCodes.has(normalizeCode(r.code))),
+      validTickets: validFiltered
     };
-  }, [results, searchQuery]);
+  }, [results, searchQuery, resolvedMissingCodes, resolvedInvalidCodes]);
 
   return (
     <div className="min-h-screen bg-[#f3f4f6] text-gray-900 font-sans pb-20">
@@ -172,7 +217,7 @@ export default function App() {
           <div className="grid md:grid-cols-2 gap-8">
             <UploadCard
               title="Payment List"
-              description="Upload the list of M-Pesa codes from the payment phone."
+              description="M-Pesa codes from payments (e.g. from payment phone or bank export)."
               file={paymentFile}
               onUpload={(e) => handleFileUpload(e, 'payment')}
               onRemove={() => {
@@ -183,7 +228,7 @@ export default function App() {
             />
             <UploadCard
               title="Ticket List"
-              description="Upload the list of M-Pesa codes used to generate tickets."
+              description="M-Pesa codes from your ticket system (same export you use to generate tickets)."
               file={ticketFile}
               onUpload={(e) => handleFileUpload(e, 'ticket')}
               onRemove={() => {
@@ -239,6 +284,17 @@ export default function App() {
               <StatCard label="Invalid Tickets" value={results.invalidTickets.length} icon={<XCircle className="text-red-600" />} />
             </div>
 
+            {/* How matching works */}
+            <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4 flex gap-3">
+              <Info className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
+              <div className="text-sm text-blue-900">
+                <p className="font-semibold mb-1">Precise matching</p>
+                <p className="text-blue-800">
+                  Codes are matched after normalising (trim, uppercase, no spaces). So <code className="bg-blue-100 px-1 rounded">ABC 123</code> and <code className="bg-blue-100 px-1 rounded">abc123</code> count as the same. &quot;Paid but no ticket&quot; = code appears in payments but not in your ticket list export. If you&apos;ve already issued that ticket (e.g. verified in your admin), tick <strong>Done</strong> to remove it from the list and keep only what still needs action.
+                </p>
+              </div>
+            </div>
+
             {/* Search and Reset */}
             <div className="flex flex-col md:flex-row justify-between items-center gap-4 bg-white p-4 rounded-2xl shadow-sm border border-gray-200">
               <div className="relative w-full md:w-96">
@@ -257,6 +313,8 @@ export default function App() {
                   setPaymentFile(null);
                   setTicketFile(null);
                   setSearchQuery('');
+                  setResolvedMissingCodes(new Set());
+                  setResolvedInvalidCodes(new Set());
                   paymentInputRef.current && (paymentInputRef.current.value = '');
                   ticketInputRef.current && (ticketInputRef.current.value = '');
                 }}
@@ -270,11 +328,12 @@ export default function App() {
             {/* Detailed Tables */}
             <div className="grid lg:grid-cols-2 gap-8">
               {/* Missing Tickets Table */}
-              <TableSection 
-                title="Paid but No Ticket" 
-                subtitle="People who paid but haven't received their tickets."
+              <TableSection
+                title="Paid but No Ticket"
+                subtitle="Code in payment list but not in ticket list. Tick Done when you've already issued the ticket (e.g. confirmed in admin)."
                 data={filteredResults?.missingTickets || []}
                 type="missing"
+                onMarkResolved={markMissingResolved}
                 onExportCSV={() => exportToCSV(results.missingTickets, 'missing_tickets')}
                 onExportTXT={() => exportToTXT(results.missingTickets, 'missing_tickets')}
                 copyToClipboard={copyToClipboard}
@@ -282,11 +341,12 @@ export default function App() {
               />
 
               {/* Invalid Tickets Table */}
-              <TableSection 
-                title="Ticket but No Payment" 
-                subtitle="Tickets generated with codes that don't exist in the payment list."
+              <TableSection
+                title="Ticket but No Payment"
+                subtitle="Code in ticket list but not in payment list. Tick Done when resolved (e.g. refund or correction done)."
                 data={filteredResults?.invalidTickets || []}
                 type="invalid"
+                onMarkResolved={markInvalidResolved}
                 onExportCSV={() => exportToCSV(results.invalidTickets, 'invalid_tickets')}
                 onExportTXT={() => exportToTXT(results.invalidTickets, 'invalid_tickets')}
                 copyToClipboard={copyToClipboard}
@@ -296,7 +356,7 @@ export default function App() {
               {/* Valid Tickets Table */}
               <TableSection 
                 title="Valid Tickets" 
-                subtitle="Successfully matched payments and tickets."
+                subtitle="Matched: code appears in both lists (normalised). No action needed."
                 data={filteredResults?.validTickets || []}
                 type="valid"
                 className="lg:col-span-2"
@@ -369,7 +429,7 @@ function StatCard({ label, value, icon }: { label: string, value: number, icon: 
   );
 }
 
-function TableSection({ title, subtitle, data, type, className = "", onExportCSV, onExportTXT, copyToClipboard, copiedCode }: any) {
+function TableSection({ title, subtitle, data, type, className = "", onMarkResolved, onExportCSV, onExportTXT, copyToClipboard, copiedCode }: any) {
   const getHeaderColor = () => {
     switch(type) {
       case 'missing': return 'border-orange-500';
@@ -378,6 +438,8 @@ function TableSection({ title, subtitle, data, type, className = "", onExportCSV
       default: return 'border-blue-500';
     }
   };
+
+  const showResolvedCheckbox = (type === 'missing' || type === 'invalid') && onMarkResolved;
 
   return (
     <div className={`bg-white rounded-3xl shadow-sm border border-gray-200 overflow-hidden flex flex-col ${className}`}>
@@ -411,6 +473,7 @@ function TableSection({ title, subtitle, data, type, className = "", onExportCSV
           <table className="w-full text-left border-collapse">
             <thead className="sticky top-0 bg-gray-50 text-[10px] uppercase tracking-wider font-bold text-gray-400">
               <tr>
+                {showResolvedCheckbox && <th className="px-4 py-3 border-b border-gray-100 w-12" title="Mark as already issued / resolved">Done</th>}
                 <th className="px-6 py-3 border-b border-gray-100">M-Pesa Code</th>
                 {type !== 'invalid' && <th className="px-6 py-3 border-b border-gray-100">Name</th>}
                 <th className="px-6 py-3 border-b border-gray-100 text-right">Action</th>
@@ -419,6 +482,19 @@ function TableSection({ title, subtitle, data, type, className = "", onExportCSV
             <tbody className="divide-y divide-gray-50">
               {data.map((record: MpesaRecord, idx: number) => (
                 <tr key={record.code + idx} className="hover:bg-gray-50/50 transition-colors group">
+                  {showResolvedCheckbox && (
+                    <td className="px-4 py-4">
+                      <button
+                        type="button"
+                        onClick={() => onMarkResolved(record.code)}
+                        className="p-1.5 rounded-md text-gray-300 hover:text-orange-500 hover:bg-orange-50 transition-all"
+                        title="Mark as resolved"
+                        aria-label={`Mark ${record.code} as resolved`}
+                      >
+                        <CheckSquare className="w-5 h-5" />
+                      </button>
+                    </td>
+                  )}
                   <td className="px-6 py-4 font-mono text-sm font-medium text-gray-700">{record.code}</td>
                   {type !== 'invalid' && (
                     <td className="px-6 py-4 text-sm text-gray-600">
@@ -442,13 +518,20 @@ function TableSection({ title, subtitle, data, type, className = "", onExportCSV
             <div className="w-12 h-12 bg-gray-50 rounded-full flex items-center justify-center mx-auto mb-4">
               <Search className="w-6 h-6 text-gray-300" />
             </div>
-            <p className="text-gray-400 font-medium">No records found</p>
+            <p className="text-gray-400 font-medium">
+              {showResolvedCheckbox ? 'No remaining items' : 'No records found'}
+            </p>
+            {showResolvedCheckbox && data.length === 0 && (
+              <p className="text-gray-400 text-xs mt-1">All resolved or no matches in this category.</p>
+            )}
           </div>
         )}
       </div>
       
       <div className="p-4 bg-gray-50 border-t border-gray-100 text-[10px] text-gray-400 flex justify-between items-center">
-        <span>Showing {data.length} records</span>
+        <span>
+          {showResolvedCheckbox ? `${data.length} remaining` : `Showing ${data.length} records`}
+        </span>
         <div className="flex gap-1">
           <div className="w-1.5 h-1.5 rounded-full bg-gray-200" />
           <div className="w-1.5 h-1.5 rounded-full bg-gray-200" />
