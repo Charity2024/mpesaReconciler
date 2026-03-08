@@ -1,0 +1,5 @@
+{
+  "name": "M-Pesa Ticket Reconciler",
+  "description": "A professional tool to reconcile M-Pesa payments with generated event tickets.",
+  "requestFramePermissions": []
+}
